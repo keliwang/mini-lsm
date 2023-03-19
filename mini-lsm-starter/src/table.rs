@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 pub use builder::SsTableBuilder;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
 use crate::lsm_storage::BlockCache;
+
+const U32_SIZE: usize = std::mem::size_of::<u32>();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -25,17 +27,32 @@ pub struct BlockMeta {
 
 impl BlockMeta {
     /// Encode block meta to a buffer.
-    pub fn encode_block_meta(
-        block_meta: &[BlockMeta],
-        #[allow(clippy::ptr_arg)] // remove this allow after you finish
-        buf: &mut Vec<u8>,
-    ) {
-        unimplemented!()
+    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+        let meta_total_size = block_meta
+            .iter()
+            .map(|meta| {
+                // offset::<u32> + first_key_len::<u16> + first_key
+                std::mem::size_of::<u32>() + std::mem::size_of::<u16>() + meta.first_key.len()
+            })
+            .sum();
+        buf.reserve(meta_total_size);
+        block_meta.iter().for_each(|meta| {
+            buf.put_u32(meta.offset as u32);
+            buf.put_u16(meta.first_key.len() as u16);
+            buf.put_slice(&meta.first_key);
+        })
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        unimplemented!()
+    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+        let mut block_meta = vec![];
+        while buf.has_remaining() {
+            let offset = buf.get_u32() as usize;
+            let first_key_len = buf.get_u16() as usize;
+            let first_key = buf.copy_to_bytes(first_key_len);
+            block_meta.push(BlockMeta { offset, first_key });
+        }
+        block_meta
     }
 }
 
@@ -53,7 +70,7 @@ impl FileObject {
 
     /// Create a new file object (day 2) and write the file to the disk (day 4).
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
-        unimplemented!()
+        Ok(Self(data.into()))
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -62,6 +79,8 @@ impl FileObject {
 }
 
 pub struct SsTable {
+    id: usize,
+    block_cache: Option<Arc<BlockCache>>,
     file: FileObject,
     block_metas: Vec<BlockMeta>,
     block_meta_offset: usize,
@@ -75,27 +94,48 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let total_len = file.size();
+        let raw_meta_offset = file.read(total_len - U32_SIZE as u64, U32_SIZE as u64)?;
+        let block_meta_offset = (&raw_meta_offset[..]).get_u32() as u64;
+        let raw_block_metas = file.read(block_meta_offset, total_len - 4 - block_meta_offset)?;
+        let block_metas = BlockMeta::decode_block_meta(&raw_block_metas[..]);
+        Ok(Self {
+            id,
+            block_cache,
+            file,
+            block_metas,
+            block_meta_offset: block_meta_offset as usize,
+        })
     }
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        let offset_begin = self.block_metas[block_idx].offset;
+        let offset_end = self
+            .block_metas
+            .get(block_idx + 1)
+            .map_or(self.block_meta_offset, |meta| meta.offset);
+        let block_meta = self
+            .file
+            .read(offset_begin as u64, (offset_end - offset_begin) as u64)?;
+        Ok(Arc::new(Block::decode(&block_meta)))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        self.read_block(block_idx)
     }
 
     /// Find the block that may contain `key`.
     pub fn find_block_idx(&self, key: &[u8]) -> usize {
-        unimplemented!()
+        self.block_metas
+            .partition_point(|meta| meta.first_key <= key)
+            .saturating_sub(1)
     }
 
     /// Get number of data blocks.
     pub fn num_of_blocks(&self) -> usize {
-        unimplemented!()
+        self.block_metas.len()
     }
 }
 
