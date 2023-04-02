@@ -1,27 +1,77 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+use std::ops::Bound;
 
 use anyhow::Result;
+use bytes::Bytes;
 
-use crate::iterators::StorageIterator;
+use crate::{
+    iterators::{
+        merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
+    },
+    mem_table::MemTableIterator,
+    table::SsTableIterator,
+};
 
-pub struct LsmIterator {}
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
+
+pub struct LsmIterator {
+    inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
+    is_valid: bool,
+}
+
+impl LsmIterator {
+    pub fn new(inner: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+        let mut iter = Self {
+            is_valid: inner.is_valid(),
+            inner,
+            end_bound,
+        };
+        iter.skip_deleted()?;
+        Ok(iter)
+    }
+
+    fn skip_deleted(&mut self) -> Result<()> {
+        while self.is_valid() && self.inner.value().is_empty() {
+            self.inner_next()?;
+        }
+
+        Ok(())
+    }
+
+    fn inner_next(&mut self) -> Result<()> {
+        self.inner.next()?;
+        if !self.inner.is_valid() {
+            self.is_valid = false;
+            return Ok(());
+        }
+
+        match self.end_bound.as_ref() {
+            Bound::Included(key) => self.is_valid = self.inner.key() <= key.as_ref(),
+            Bound::Excluded(key) => self.is_valid = self.inner.key() < key.as_ref(),
+            Bound::Unbounded => {}
+        }
+        Ok(())
+    }
+}
 
 impl StorageIterator for LsmIterator {
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.is_valid
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.inner_next()?;
+        self.skip_deleted()?;
+        Ok(())
     }
 }
 
@@ -39,18 +89,22 @@ impl<I: StorageIterator> FusedIterator<I> {
 
 impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.iter.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.iter.is_valid() {
+            self.iter.next()?;
+        }
+
+        Ok(())
     }
 }

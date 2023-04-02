@@ -9,6 +9,14 @@ use ouroboros::self_referencing;
 use crate::iterators::StorageIterator;
 use crate::table::SsTableBuilder;
 
+pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
+        Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
 /// A basic mem-table based on crossbeam-skiplist
 pub struct MemTable {
     map: Arc<SkipMap<Bytes, Bytes>>,
@@ -37,20 +45,12 @@ impl MemTable {
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
-            iter_builder: |map| map.range((self.map_bound(lower), self.map_bound(upper))),
+            iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
             item: (Bytes::new(), Bytes::new()),
         }
         .build();
         iter.next().unwrap();
         iter
-    }
-
-    fn map_bound(&self, bound: Bound<&[u8]>) -> Bound<Bytes> {
-        match bound {
-            Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
-            Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
-            Bound::Unbounded => Bound::Unbounded,
-        }
     }
 
     /// Flush the mem-table to SSTable.
