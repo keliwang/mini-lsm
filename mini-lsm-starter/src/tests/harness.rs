@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, ops::Bound, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, ops::Bound, os::unix::fs::MetadataExt, path::Path, sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
@@ -8,10 +11,10 @@ use crate::{
         CompactionOptions, LeveledCompactionOptions, SimpleLeveledCompactionOptions,
         TieredCompactionOptions,
     },
-    iterators::StorageIterator,
+    iterators::{merge_iterator::MergeIterator, StorageIterator},
     key::{KeySlice, TS_ENABLED},
-    lsm_storage::{BlockCache, LsmStorageInner, MiniLsm},
-    table::{SsTable, SsTableBuilder},
+    lsm_storage::{BlockCache, LsmStorageInner, LsmStorageState, MiniLsm},
+    table::{SsTable, SsTableBuilder, SsTableIterator},
 };
 
 #[derive(Clone)]
@@ -111,6 +114,37 @@ where
     assert!(!iter.is_valid());
 }
 
+#[allow(dead_code)]
+pub fn check_iter_result_by_key_and_ts<I>(iter: &mut I, expected: Vec<((Bytes, u64), Bytes)>)
+where
+    I: for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+{
+    for ((k, ts), v) in expected {
+        assert!(iter.is_valid());
+        assert_eq!(
+            (&k[..], ts),
+            (
+                iter.key().for_testing_key_ref(),
+                iter.key().for_testing_ts()
+            ),
+            "expected key: {:?}@{}, actual key: {:?}@{}",
+            k,
+            ts,
+            as_bytes(iter.key().for_testing_key_ref()),
+            iter.key().for_testing_ts(),
+        );
+        assert_eq!(
+            v,
+            iter.value(),
+            "expected value: {:?}, actual value: {:?}",
+            v,
+            as_bytes(iter.value()),
+        );
+        iter.next().unwrap();
+    }
+    assert!(!iter.is_valid());
+}
+
 pub fn check_lsm_iter_result_by_key<I>(iter: &mut I, expected: Vec<(Bytes, Bytes)>)
 where
     I: for<'a> StorageIterator<KeyType<'a> = &'a [u8]>,
@@ -159,6 +193,23 @@ pub fn generate_sst(
     builder.build(id, block_cache, path.as_ref()).unwrap()
 }
 
+#[allow(dead_code)]
+pub fn generate_sst_with_ts(
+    id: usize,
+    path: impl AsRef<Path>,
+    data: Vec<((Bytes, u64), Bytes)>,
+    block_cache: Option<Arc<BlockCache>>,
+) -> SsTable {
+    let mut builder = SsTableBuilder::new(128);
+    for ((key, ts), value) in data {
+        builder.add(
+            KeySlice::for_testing_from_slice_with_ts(&key[..], ts),
+            &value[..],
+        );
+    }
+    builder.build(id, block_cache, path.as_ref()).unwrap()
+}
+
 pub fn sync(storage: &LsmStorageInner) {
     storage
         .force_freeze_memtable(&storage.state_lock.lock())
@@ -184,6 +235,7 @@ pub fn compaction_bench(storage: Arc<MiniLsm>) {
             max_key = max_key.max(i);
         }
     }
+
     std::thread::sleep(Duration::from_secs(1)); // wait until all memtables flush
     while {
         let snapshot = storage.inner.state.read();
@@ -243,6 +295,11 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
         };
         level_size.push(size);
     }
+    let extra_iterators = if TS_ENABLED {
+        1 /* txn local iterator for OCC */
+    } else {
+        0
+    };
     let num_iters = storage
         .scan(Bound::Unbounded, Bound::Unbounded)
         .unwrap()
@@ -274,8 +331,8 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
                 );
             }
             assert!(
-                num_iters <= l0_sst_num + num_memtables + max_levels,
-                "did you use concat iterators?"
+                num_iters <= l0_sst_num + num_memtables + max_levels + extra_iterators,
+                "we found {num_iters} iterators in your implementation, (l0_sst_num={l0_sst_num}, num_memtables={num_memtables}, max_levels={max_levels}) did you use concat iterators?"
             );
         }
         CompactionOptions::Leveled(LeveledCompactionOptions {
@@ -286,23 +343,24 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
         }) => {
             assert!(l0_sst_num < level0_file_num_compaction_trigger);
             assert!(level_size.len() <= max_levels);
-            for idx in 1..level_size.len() {
-                let prev_size = level_size[idx - 1];
-                let this_size = level_size[idx];
+            let last_level_size = *level_size.last().unwrap();
+            let mut multiplier = 1.0;
+            for idx in (1..level_size.len()).rev() {
+                multiplier *= level_size_multiplier as f64;
+                let this_size = level_size[idx - 1];
                 assert!(
                     // do not add hard requirement on level size multiplier considering bloom filters...
-                    this_size as f64 / prev_size as f64 >= (level_size_multiplier as f64 - 0.5),
-                    "L{}/L{}, {}/{}<<{}",
-                    state.levels[idx].0,
+                    this_size as f64 / last_level_size as f64 <= 1.0 / multiplier + 0.5,
+                    "L{}/L_max, {}/{}>>1.0/{}",
                     state.levels[idx - 1].0,
                     this_size,
-                    prev_size,
-                    level_size_multiplier
+                    last_level_size,
+                    multiplier
                 );
             }
             assert!(
-                num_iters <= l0_sst_num + num_memtables + max_levels,
-                "did you use concat iterators?"
+                num_iters <= l0_sst_num + num_memtables + max_levels + extra_iterators,
+                "we found {num_iters} iterators in your implementation, (l0_sst_num={l0_sst_num}, num_memtables={num_memtables}, max_levels={max_levels}) did you use concat iterators?"
             );
         }
         CompactionOptions::Tiered(TieredCompactionOptions {
@@ -343,15 +401,42 @@ pub fn check_compaction_ratio(storage: Arc<MiniLsm>) {
                 sum_size += this_size;
             }
             assert!(
-                num_iters <= num_memtables + num_tiers,
-                "did you use concat iterators?"
+                num_iters <= num_memtables + num_tiers + extra_iterators,
+                "we found {num_iters} iterators in your implementation, (num_memtables={num_memtables}, num_tiers={num_tiers}) did you use concat iterators?"
             );
         }
     }
 }
 
 pub fn dump_files_in_dir(path: impl AsRef<Path>) {
+    println!("--- DIR DUMP ---");
     for f in path.as_ref().read_dir().unwrap() {
-        println!("{}", f.unwrap().path().display())
+        let f = f.unwrap();
+        print!("{}", f.path().display());
+        println!(
+            ", size={:.3}KB",
+            f.metadata().unwrap().size() as f64 / 1024.0
+        );
     }
+}
+
+pub fn construct_merge_iterator_over_storage(
+    state: &LsmStorageState,
+) -> MergeIterator<SsTableIterator> {
+    let mut iters = Vec::new();
+    for t in &state.l0_sstables {
+        iters.push(Box::new(
+            SsTableIterator::create_and_seek_to_first(state.sstables.get(t).cloned().unwrap())
+                .unwrap(),
+        ));
+    }
+    for (_, files) in &state.levels {
+        for f in files {
+            iters.push(Box::new(
+                SsTableIterator::create_and_seek_to_first(state.sstables.get(f).cloned().unwrap())
+                    .unwrap(),
+            ));
+        }
+    }
+    MergeIterator::create(iters)
 }
