@@ -125,7 +125,32 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let u32_size = std::mem::size_of::<u32>() as u64;
+        let block_meta_end_offset = file.size() - u32_size;
+        let block_meta_offset = file
+            .read(block_meta_end_offset, u32_size)?
+            .as_slice()
+            .get_u32() as usize;
+        let block_meta_size = block_meta_end_offset - block_meta_offset as u64;
+        let block_meta_data = file.read(block_meta_offset as u64, block_meta_size)?;
+        let block_meta = BlockMeta::decode_block_meta(block_meta_data.as_slice());
+        let first_key = block_meta
+            .first()
+            .map_or_else(KeyBytes::default, |meta| meta.first_key.clone());
+        let last_key = block_meta
+            .last()
+            .map_or_else(KeyBytes::default, |meta| meta.last_key.clone());
+        Ok(Self {
+            id,
+            file,
+            block_cache,
+            block_meta,
+            block_meta_offset,
+            first_key,
+            last_key,
+            bloom: None,
+            max_ts: 0,
+        })
     }
 
     /// Create a mock SST with only first key + last key metadata
@@ -150,7 +175,14 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        let offset_begin = self.block_meta[block_idx].offset;
+        let offset_end = self
+            .block_meta
+            .get(block_idx + 1)
+            .map_or(self.block_meta_offset, |meta| meta.offset);
+        let block_size = offset_end - offset_begin;
+        let block_data = self.file.read(offset_begin as u64, block_size as u64)?;
+        Ok(Arc::new(Block::decode(block_data.as_slice())))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
@@ -162,7 +194,9 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        unimplemented!()
+        self.block_meta
+            .partition_point(|meta| meta.first_key.as_key_slice() <= key)
+            .saturating_sub(1)
     }
 
     /// Get number of data blocks.
