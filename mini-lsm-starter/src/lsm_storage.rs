@@ -16,11 +16,14 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -395,8 +398,32 @@ impl LsmStorageInner {
         for memtable in snapshot.imm_memtables.iter() {
             memtable_iters.push(Box::new(memtable.scan(lower, upper)));
         }
-
         let memtable_iter = MergeIterator::create(memtable_iters);
-        Ok(FusedIterator::new(LsmIterator::new(memtable_iter)?))
+
+        let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for table_id in snapshot.l0_sstables.iter() {
+            let table = snapshot.sstables[table_id].clone();
+            let iter = match lower {
+                Bound::Included(key) => {
+                    SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
+                }
+                Bound::Excluded(key) => {
+                    let mut iter =
+                        SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?;
+                    if iter.is_valid() && iter.key().raw_ref() == key {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+            };
+            l0_iters.push(Box::new(iter));
+        }
+        let l0_iter = MergeIterator::create(l0_iters);
+        let iter = TwoMergeIterator::create(memtable_iter, l0_iter)?;
+        Ok(FusedIterator::new(LsmIterator::new(
+            iter,
+            map_bound(upper),
+        )?))
     }
 }
