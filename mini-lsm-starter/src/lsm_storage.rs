@@ -117,6 +117,39 @@ impl LsmStorageOptions {
     }
 }
 
+fn range_overlap(
+    user_lower: Bound<&[u8]>,
+    user_upper: Bound<&[u8]>,
+    table_first: KeySlice,
+    table_last: KeySlice,
+) -> bool {
+    match user_upper {
+        Bound::Included(key) if key < table_first.raw_ref() => {
+            return false;
+        }
+        Bound::Excluded(key) if key <= table_first.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+
+    match user_lower {
+        Bound::Included(key) if key > table_last.raw_ref() => {
+            return false;
+        }
+        Bound::Excluded(key) if key >= table_last.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+
+    true
+}
+
+fn key_within(user_key: &[u8], table_first: KeySlice, table_last: KeySlice) -> bool {
+    user_key >= table_first.raw_ref() && user_key <= table_last.raw_ref()
+}
+
 #[derive(Clone, Debug)]
 pub enum CompactionFilter {
     Prefix(Bytes),
@@ -318,6 +351,13 @@ impl LsmStorageInner {
         let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
+            if !key_within(
+                key,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                continue;
+            }
             let iter = SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?;
             l0_iters.push(Box::new(iter));
         }
@@ -402,7 +442,7 @@ impl LsmStorageInner {
 
         let last_memtable = {
             let guard = self.state.read();
-            Arc::clone(&guard.imm_memtables.last().unwrap())
+            Arc::clone(guard.imm_memtables.last().unwrap())
         };
         let mut builder = SsTableBuilder::new(self.options.block_size);
         last_memtable.flush(&mut builder)?;
@@ -456,6 +496,15 @@ impl LsmStorageInner {
         let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
+            if !range_overlap(
+                lower,
+                upper,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                continue;
+            }
+
             let iter = match lower {
                 Bound::Included(key) => {
                     SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
