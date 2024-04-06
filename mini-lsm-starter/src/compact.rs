@@ -15,7 +15,9 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
@@ -166,13 +168,21 @@ impl LsmStorageInner {
                 l0_sstables,
                 l1_sstables,
             } => {
-                let mut iters = Vec::with_capacity(l0_sstables.len() + l1_sstables.len());
-                for sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
-                    iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                let mut l0_iters = Vec::with_capacity(l0_sstables.len());
+                for sst_id in l0_sstables {
+                    l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
                         snapshot.sstables.get(sst_id).unwrap().clone(),
                     )?));
                 }
-                let iter = MergeIterator::create(iters);
+                let l0_iter = MergeIterator::create(l0_iters);
+
+                let mut l1_ssts = Vec::with_capacity(l1_sstables.len());
+                for sst_id in l1_sstables {
+                    l1_ssts.push(snapshot.sstables.get(sst_id).unwrap().clone());
+                }
+                let l1_iter = SstConcatIterator::create_and_seek_to_first(l1_ssts)?;
+
+                let iter = TwoMergeIterator::create(l0_iter, l1_iter)?;
                 self.generate_sst_from_iter(iter)
             }
         }
