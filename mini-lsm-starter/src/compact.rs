@@ -21,6 +21,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -251,7 +252,7 @@ impl LsmStorageInner {
         let new_sstables = self.compact(&compaction_task)?;
         let mut sst_ids = Vec::with_capacity(new_sstables.len());
         {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut latest_snapshot = self.state.read().as_ref().clone();
 
             for sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
@@ -266,6 +267,12 @@ impl LsmStorageInner {
             let removed_sst_ids = latest_snapshot.l0_sstables.split_off(split_idx);
             assert_eq!(removed_sst_ids, l0_sstables);
             *self.state.write() = Arc::new(latest_snapshot);
+
+            self.sync_dir()?;
+            self.manifest.as_ref().unwrap().add_record(
+                &state_lock,
+                ManifestRecord::Compaction(compaction_task, sst_ids.clone()),
+            )?;
         }
 
         for sst_id in l0_sstables.iter().chain(l1_sstables.iter()) {
@@ -291,7 +298,7 @@ impl LsmStorageInner {
         let ssts = self.compact(&task)?;
         let sst_ids = ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>();
         let files_to_remove = {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
             for sst in ssts {
                 let result = snapshot.sstables.insert(sst.sst_id(), sst);
@@ -311,6 +318,13 @@ impl LsmStorageInner {
             let mut state = self.state.write();
             *state = Arc::new(snapshot);
             drop(state);
+
+            self.sync_dir()?;
+            self.manifest.as_ref().unwrap().add_record(
+                &state_lock,
+                ManifestRecord::Compaction(task, sst_ids.clone()),
+            )?;
+
             files_to_remove
         };
         println!(
