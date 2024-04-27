@@ -9,7 +9,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -187,9 +187,16 @@ impl SsTable {
             .block_meta
             .get(block_idx + 1)
             .map_or(self.block_meta_offset, |meta| meta.offset);
-        let block_size = offset_end - offset_begin;
-        let block_data = self.file.read(offset_begin as u64, block_size as u64)?;
-        Ok(Arc::new(Block::decode(block_data.as_slice())))
+        let block_size = offset_end - offset_begin - std::mem::size_of::<u32>();
+        let block_data_with_checksum = self
+            .file
+            .read(offset_begin as u64, (offset_end - offset_begin) as u64)?;
+        let block_data = &block_data_with_checksum[..block_size];
+        let checksum = (&block_data_with_checksum[block_size..]).get_u32();
+        if checksum != crc32fast::hash(block_data) {
+            bail!("block checksum mismatch");
+        }
+        Ok(Arc::new(Block::decode(block_data)))
     }
 
     /// Read a block from disk, with block cache. (Day 4)

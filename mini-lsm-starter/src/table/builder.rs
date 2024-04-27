@@ -66,7 +66,10 @@ impl SsTableBuilder {
         });
 
         let builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
-        self.data.extend(builder.build().encode());
+        let encoded_block = builder.build().encode();
+        let checksum = crc32fast::hash(&encoded_block);
+        self.data.extend(encoded_block);
+        self.data.put_u32(checksum);
         self.first_key.clear();
         self.last_key.clear();
     }
