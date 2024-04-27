@@ -1,6 +1,6 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
@@ -216,7 +216,7 @@ impl MiniLsm {
 
         if !self.inner.state.read().memtable.is_empty() {
             self.inner
-                .freeze_current_memtable(Arc::new(MemTable::create(self.inner.next_sst_id())));
+                .freeze_current_memtable(Arc::new(MemTable::create(self.inner.next_sst_id())))?;
         }
         while !self.inner.state.read().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
@@ -330,12 +330,27 @@ impl LsmStorageInner {
         let manifest_path = path.join("MANIFEST");
         let manifest;
         if !manifest_path.exists() {
+            if options.enable_wal {
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    state.memtable.id(),
+                    Self::path_of_wal_static(path, state.memtable.id()),
+                )?);
+            }
             manifest = Manifest::create(&manifest_path)?;
+            manifest.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
         } else {
+            let mut memtables = BTreeSet::new();
             let (m, records) = Manifest::recover(&manifest_path)?;
             for record in records {
                 match record {
+                    crate::manifest::ManifestRecord::NewMemtable(sst_id) => {
+                        next_sst_id = next_sst_id.max(sst_id);
+                        memtables.insert(sst_id);
+                    }
                     crate::manifest::ManifestRecord::Flush(sst_id) => {
+                        let exist = memtables.remove(&sst_id);
+                        assert!(exist, "memtable not exist");
+
                         if compaction_controller.flush_to_l0() {
                             state.l0_sstables.insert(0, sst_id);
                         } else {
@@ -350,7 +365,6 @@ impl LsmStorageInner {
                         next_sst_id =
                             next_sst_id.max(output.iter().max().copied().unwrap_or_default());
                     }
-                    crate::manifest::ManifestRecord::NewMemtable(_) => todo!(),
                 }
             }
 
@@ -370,7 +384,24 @@ impl LsmStorageInner {
             }
 
             next_sst_id += 1;
-            state.memtable = Arc::new(MemTable::create(next_sst_id));
+
+            if options.enable_wal {
+                for &sst_id in memtables.iter() {
+                    let memtable =
+                        MemTable::recover_from_wal(sst_id, Self::path_of_wal_static(path, sst_id))?;
+                    if !memtable.is_empty() {
+                        println!("recover memtable from wal. id: {}", memtable.id());
+                        state.imm_memtables.insert(0, Arc::new(memtable));
+                    }
+                }
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    next_sst_id,
+                    Self::path_of_wal_static(path, next_sst_id),
+                )?);
+            } else {
+                state.memtable = Arc::new(MemTable::create(next_sst_id));
+            }
+            m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
 
             next_sst_id += 1;
             manifest = m;
@@ -393,7 +424,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -537,18 +568,36 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        let memtable = Arc::new(MemTable::create(self.next_sst_id()));
-        self.freeze_current_memtable(memtable);
+    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        let sst_id = self.next_sst_id();
+        let memtable = if self.options.enable_wal {
+            Arc::new(MemTable::create_with_wal(sst_id, self.path_of_wal(sst_id))?)
+        } else {
+            Arc::new(MemTable::create(sst_id))
+        };
+
+        self.freeze_current_memtable(memtable)?;
+
+        self.manifest
+            .as_ref()
+            .unwrap()
+            .add_record(state_lock_observer, ManifestRecord::NewMemtable(sst_id))?;
+        self.sync_dir()?;
+
         Ok(())
     }
 
-    fn freeze_current_memtable(&self, memtable: Arc<MemTable>) {
+    fn freeze_current_memtable(&self, memtable: Arc<MemTable>) -> Result<()> {
         let mut state = self.state.write();
         let mut snapshot = state.as_ref().clone();
         let prev_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
-        snapshot.imm_memtables.insert(0, prev_memtable);
+        snapshot.imm_memtables.insert(0, prev_memtable.clone());
         *state = Arc::new(snapshot);
+
+        drop(state);
+        prev_memtable.sync_wal()?;
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -583,11 +632,17 @@ impl LsmStorageInner {
             *guard = Arc::new(snapshot);
         }
 
-        self.sync_dir()?;
+        if self.options.enable_wal {
+            std::fs::remove_file(self.path_of_wal(sst_id))?;
+        }
+
         self.manifest
             .as_ref()
             .unwrap()
             .add_record(&state_lock, crate::manifest::ManifestRecord::Flush(sst_id))?;
+
+        self.sync_dir()?;
+
         Ok(())
     }
 
