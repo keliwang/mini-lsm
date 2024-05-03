@@ -1,5 +1,3 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
 mod leveled;
 mod simple_leveled;
 mod tiered;
@@ -179,8 +177,14 @@ impl LsmStorageInner {
                 let iter = MergeIterator::create(iters);
                 self.generate_sst_from_iter(iter, task.compact_to_bottom_level())
             }
-            CompactionTask::Leveled(_) => todo!(),
-            CompactionTask::Simple(SimpleLeveledCompactionTask {
+            CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level: _,
+                lower_level_sst_ids,
+                ..
+            })
+            | CompactionTask::Simple(SimpleLeveledCompactionTask {
                 upper_level,
                 upper_level_sst_ids,
                 lower_level: _,
@@ -273,7 +277,7 @@ impl LsmStorageInner {
                 sst_ids.push(sst.sst_id());
                 latest_snapshot.sstables.insert(sst.sst_id(), sst);
             }
-            latest_snapshot.levels[0].1 = sst_ids.clone();
+            latest_snapshot.levels[0].1.clone_from(&sst_ids);
             let split_idx = latest_snapshot.l0_sstables.len() - l0_sstables.len();
             let removed_sst_ids = latest_snapshot.l0_sstables.split_off(split_idx);
             assert_eq!(removed_sst_ids, l0_sstables);
