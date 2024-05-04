@@ -7,7 +7,7 @@ use crate::{
     key::{KeySlice, KeyVec},
 };
 
-use super::Block;
+use super::{Block, U64_SIZE};
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -28,7 +28,8 @@ fn block_read_first_key(block: &Block) -> KeyVec {
     let _overlap_len = buf.get_u16();
     let key_len = buf.get_u16() as usize;
     let key = &buf[..key_len];
-    KeyVec::from_vec(key.to_vec())
+    buf.advance(key_len);
+    KeyVec::from_vec_with_ts(key.to_vec(), buf.get_u64())
 }
 
 impl BlockIterator {
@@ -120,12 +121,13 @@ impl BlockIterator {
         let key_len = entry.get_u16() as usize;
         let key = &entry[..key_len];
         self.key.clear();
-        self.key.append(&self.first_key.raw_ref()[..overlap_len]);
+        self.key.append(&self.first_key.key_ref()[..overlap_len]);
         self.key.append(key);
         entry.advance(key_len);
+        self.key.set_ts(entry.get_u64());
 
         let value_len = entry.get_u16() as usize;
-        let value_begin = offset + U16_SIZE + U16_SIZE + key_len + U16_SIZE;
+        let value_begin = offset + U16_SIZE + U16_SIZE + key_len + U64_SIZE + U16_SIZE;
         let value_end = value_begin + value_len;
         self.value_range = (value_begin, value_end);
         entry.advance(value_len);

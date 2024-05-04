@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use bytes::BufMut;
 
 use crate::key::{KeySlice, KeyVec};
@@ -36,7 +33,7 @@ impl BlockBuilder {
         assert!(!key.is_empty(), "key is empty");
 
         // (key_len (2B) | key (keylen) | value_len (2B) | value (varlen)) + offset (2B)
-        let extra_size = U16_SIZE + key.len() + U16_SIZE + value.len() + U16_SIZE;
+        let extra_size = U16_SIZE + key.key_len() + U16_SIZE + value.len() + U16_SIZE;
         if self.approximate_size() + extra_size > self.block_size && !self.is_empty() {
             return false;
         }
@@ -47,9 +44,11 @@ impl BlockBuilder {
         // key overlap part len
         self.data.put_u16(overlap as u16);
         // key non-overlap part len
-        self.data.put_u16((key.len() - overlap) as u16);
+        self.data.put_u16((key.key_len() - overlap) as u16);
         // key non-overlap part
-        self.data.put(&key.raw_ref()[overlap..]);
+        self.data.put(&key.key_ref()[overlap..]);
+        // key ts
+        self.data.put_u64(key.ts());
         // value len
         self.data.put_u16(value.len() as u16);
         // value content
@@ -87,10 +86,10 @@ impl BlockBuilder {
 fn compute_overlap(base_key: KeySlice, key: KeySlice) -> usize {
     let mut idx = 0;
     loop {
-        if idx >= base_key.len() || idx >= key.len() {
+        if idx >= base_key.key_len() || idx >= key.key_len() {
             break;
         }
-        if base_key.raw_ref()[idx] != key.raw_ref()[idx] {
+        if base_key.key_ref()[idx] != key.key_ref()[idx] {
             break;
         }
         idx += 1;

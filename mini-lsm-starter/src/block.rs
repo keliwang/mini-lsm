@@ -6,6 +6,7 @@ use bytes::{Buf, BufMut, Bytes};
 pub use iterator::BlockIterator;
 
 pub const U16_SIZE: usize = std::mem::size_of::<u16>();
+pub const U64_SIZE: usize = std::mem::size_of::<u64>();
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
 pub struct Block {
