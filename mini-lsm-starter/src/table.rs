@@ -31,7 +31,7 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], max_ts: u64, buf: &mut Vec<u8>) {
         let offset = buf.len();
         buf.put_u32(block_meta.len() as u32);
         block_meta.iter().for_each(|meta| {
@@ -43,12 +43,13 @@ impl BlockMeta {
             buf.put(meta.last_key.key_ref());
             buf.put_u64(meta.last_key.ts());
         });
+        buf.put_u64(max_ts);
         let checksum = crc32fast::hash(&buf[offset..]);
         buf.put_u32(checksum);
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: &[u8]) -> Result<Vec<BlockMeta>> {
+    pub fn decode_block_meta(buf: &[u8]) -> Result<(Vec<BlockMeta>, u64)> {
         let checksum_offset = buf.len() - std::mem::size_of::<u32>();
         let mut data = &buf[..checksum_offset];
         let checksum = (&buf[checksum_offset..]).get_u32();
@@ -71,7 +72,8 @@ impl BlockMeta {
                 last_key,
             });
         }
-        Ok(block_meta)
+        let max_ts = data.get_u64();
+        Ok((block_meta, max_ts))
     }
 }
 
@@ -150,7 +152,7 @@ impl SsTable {
             .get_u32() as u64;
         let block_meta_size = block_meta_end_offset - block_meta_offset;
         let block_meta_data = file.read(block_meta_offset, block_meta_size)?;
-        let block_meta = BlockMeta::decode_block_meta(block_meta_data.as_slice())?;
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(block_meta_data.as_slice())?;
         let first_key = block_meta
             .first()
             .map_or_else(KeyBytes::default, |meta| meta.first_key.clone());
@@ -166,7 +168,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 
