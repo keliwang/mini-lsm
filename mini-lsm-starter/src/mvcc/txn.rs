@@ -34,6 +34,10 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("txn already committed")
+        }
+
         if let Some(entry) = self.local_storage.get(key) {
             if entry.value().is_empty() {
                 return Ok(None);
@@ -45,6 +49,10 @@ impl Transaction {
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("txn already committed")
+        }
+
         let mut txn_local_iter = TxnLocalIteratorBuilder {
             map: self.local_storage.clone(),
             iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
@@ -62,11 +70,19 @@ impl Transaction {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("txn already committed")
+        }
+
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
 
     pub fn delete(&self, key: &[u8]) {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("txn already committed")
+        }
+
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::new());
     }
@@ -74,7 +90,7 @@ impl Transaction {
     pub fn commit(&self) -> Result<()> {
         self.committed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .expect("tnx is already committed");
+            .expect("txn is already committed");
         let batch = self
             .local_storage
             .iter()
